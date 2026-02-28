@@ -1,0 +1,193 @@
+Claude’s Plan
+FFB Racing Sim Wheel & Pedal Set - Implementation Plan
+Context
+Building a high-fidelity direct-drive force feedback racing wheel and load cell pedal set to rival commercial DD wheels (Simucube, VRS). Uses an ESP32-S3 (native USB-OTG required for HID+PID) and ASD2100 servo motor drive (RS485/Modbus RTU) for torque control.
+
+Hardware Summary
+Component	Choice
+MCU	ESP32-S3-DevKitC-1 (N16R8 recommended)
+Motor Drive	ASD2100 via RS485 Modbus RTU (torque mode)
+Steering Encoder	16-bit+ absolute encoder (AS5048A 14-bit SPI or RLS Orbis 16-bit)
+Brake Pedal	Load cell + HX711 (24-bit ADC) or NAU7802 (320 SPS, better rate)
+Throttle/Clutch	Hall effect sensors via ESP32-S3 ADC
+RS485 Transceiver	MAX485 or SP3485 with ESD protection
+USB	Native USB-OTG (TinyUSB composite: HID + CDC)
+Architecture Overview
+
+  PC (Game)                         ESP32-S3
+  ┌──────────┐    USB HID+PID     ┌──────────────────────────────────┐
+  │ iRacing  │◄──────────────────►│  Core 0: USB + Comms             │
+  │ ACC      │   steering/pedals  │    TinyUSB HID (input reports)   │
+  │ BeamNG   │   FFB effects      │    PID handler (effect parsing)  │
+  └──────────┘                    │    CDC serial (desktop app)      │
+                                  ├──────────────────────────────────┤
+  Desktop App     CDC Serial      │  Core 1: FFB Control Loop @1kHz │
+  ┌──────────┐◄──────────────────►│    Read encoder (SPI)            │
+  │ PySide6  │   config/tuning    │    Read pedals (ADC/HX711)       │
+  │ pyqtgraph│   telemetry        │    Calculate FFB effects         │
+  └──────────┘                    │    Send torque via Modbus        │
+                                  └──────────┬─────────────────────────┘
+                                             │ RS485 Modbus RTU
+                                  ┌──────────▼─────────────────────────┐
+                                  │  ASD2100 Servo Drive (Torque Mode) │
+                                  │  → Motor                           │
+                                  └────────────────────────────────────┘
+Core 1 runs the FFB control task at 1kHz (highest priority, pinned):
+
+Read encoder position → compute velocity & acceleration
+Calculate all active FFB effects (up to 40 simultaneous)
+Sum forces, apply endstops, global gain, safety clamp, slew rate limit
+Send torque command to ASD2100 via Modbus
+Core 0 handles USB and communications (lower priority):
+
+TinyUSB device task (HID input reports + PID output reports)
+CDC serial for desktop app communication
+Housekeeping (NVS saves, safety monitoring, status LED)
+Project Structure
+
+FFB_Project/
+├── firmware/                         # PlatformIO project
+│   ├── platformio.ini
+│   ├── include/
+│   │   ├── config.h                  # Pin definitions, constants
+│   │   └── board_pinout.h
+│   ├── src/
+│   │   ├── main.cpp                  # FreeRTOS task creation, init
+│   │   ├── usb/
+│   │   │   ├── usb_hid.cpp           # TinyUSB init, report sending
+│   │   │   ├── hid_descriptor.h      # HID+PID report descriptor
+│   │   │   ├── pid_handler.cpp       # Parse PID reports, manage effect pool
+│   │   │   └── reports.h             # Packed report structs
+│   │   ├── ffb/
+│   │   │   ├── effect_engine.cpp     # Main 1kHz calculator (combines all effects)
+│   │   │   ├── effects.h             # Effect type enums, parameter structs
+│   │   │   ├── effect_constant.cpp
+│   │   │   ├── effect_periodic.cpp   # Sine, square, triangle, sawtooth
+│   │   │   ├── effect_conditional.cpp # Spring, damper, friction, inertia
+│   │   │   ├── effect_ramp.cpp
+│   │   │   ├── effect_envelope.cpp
+│   │   │   ├── endstop.cpp           # Virtual soft endstops
+│   │   │   └── filters.h             # Low-pass, slew rate limiter
+│   │   ├── motor/
+│   │   │   ├── modbus_master.cpp     # RS485 Modbus RTU on UART2
+│   │   │   ├── asd2100_driver.cpp    # ASD2100-specific register commands
+│   │   │   └── motor_safety.h
+│   │   ├── input/
+│   │   │   ├── encoder.cpp           # SPI absolute encoder + multi-turn
+│   │   │   ├── pedals.cpp            # Load cell + hall effect reading
+│   │   │   ├── hx711.cpp             # HX711 bit-bang driver
+│   │   │   └── input_filter.h        # Kalman/moving average
+│   │   ├── config/
+│   │   │   ├── settings.cpp          # NVS persistence (with CRC + backup)
+│   │   │   └── profile.cpp           # Multi-profile support
+│   │   ├── comms/
+│   │   │   └── serial_protocol.cpp   # CDC serial command interface
+│   │   └── safety/
+│   │       ├── safety_monitor.cpp    # Watchdog, fault detection, e-stop
+│   │       └── fault_codes.h
+│   └── test/
+│       ├── test_effect_engine.cpp
+│       └── test_pid_parser.cpp
+├── desktop_app/                      # Python + PySide6
+│   ├── requirements.txt
+│   ├── src/
+│   │   ├── main.py
+│   │   ├── main_window.py
+│   │   ├── serial_comm.py            # Auto-detect by VID/PID
+│   │   └── widgets/
+│   │       ├── ffb_settings.py       # Gain sliders, per-effect scaling
+│   │       ├── pedal_calibration.py  # Wizard + response curves
+│   │       ├── steering_settings.py  # Rotation range, center cal
+│   │       ├── safety_panel.py       # Max torque, e-stop, faults
+│   │       ├── live_monitor.py       # Real-time telemetry graphs
+│   │       └── profile_manager.py
+├── docs/
+│   ├── architecture.md
+│   ├── wiring_diagram.md
+│   └── hid_descriptor.md
+├── hardware/
+│   └── kicad/                        # PCB design (Phase 6)
+└── tools/
+    └── modbus_test.py                # Standalone Modbus register tester
+Key Features
+FFB Effects (Full DirectInput PID Suite)
+Constant Force - road feel, self-aligning torque, collisions
+Spring - centering force with dead band and saturation
+Damper - velocity-proportional resistance (removes oscillation)
+Friction - constant opposing force when moving
+Inertia - acceleration-proportional resistance (simulates wheel mass)
+Periodic - sine, square, triangle, sawtooth up/down (engine rumble, road texture)
+Ramp - linear force change over time
+Envelope - attack/fade modulation on any effect
+Soft Endstops - virtual walls at configurable rotation limits (180°-1080°+)
+USB HID
+Composite device: HID (gamepad + PID) + CDC (serial config)
+16-bit steering axis, 16-bit throttle/brake/clutch, 24 buttons, hat switch
+1kHz input report rate
+40 simultaneous effect slots
+Desktop App (PySide6 + pyqtgraph)
+FFB tuning: global gain, per-effect-type gain multipliers
+Pedal calibration wizard with response curve editor (linear/gamma/S-curve)
+Steering: rotation range, center calibration
+Real-time telemetry graphs (torque, position, velocity, pedal values)
+Profile save/load/export
+Safety panel with e-stop and fault display
+Safety (Non-Negotiable)
+Hardware E-Stop: Physical NC kill switch in series with ASD2100 enable line
+Firmware torque limits: Hard compile-time cap + user-adjustable limit (clamped to hard cap)
+Slew rate limiter: Prevents instantaneous torque spikes (whip prevention)
+Watchdog: FFB task must feed watchdog every 5ms or motor disables
+Modbus timeout: No valid response for >50ms → motor disable
+USB disconnect: Ramp torque to zero over 200ms, then disable after 5s
+Startup sequence: Motor disabled on boot, requires explicit enable after full init
+No dynamic allocation in control loop (all pre-allocated)
+Development Phases
+Phase 1: Foundation (ESP32-S3 + USB HID)
+PlatformIO project setup for ESP32-S3
+TinyUSB composite device (HID + CDC)
+Minimal gamepad HID descriptor (steering axis + buttons)
+Verify Windows sees it in Game Controllers
+CDC serial echo test
+Phase 2: Encoder + Motor Control
+SPI encoder driver with multi-turn tracking
+Velocity/acceleration computation with filtering
+Modbus RTU master on UART2
+ASD2100 initialization (torque mode, enable)
+Send constant torque, verify motor response
+Basic safety: torque clamp, e-stop on fault
+Phase 3: PID Force Feedback (core of the project)
+Full HID PID report descriptor
+PID report handler + effect pool (40 slots)
+Effect engine implementing all effect types
+1kHz control loop on Core 1
+Test with DXTweak2, ffbtest, then real sim titles
+Phase 4: Pedals
+HX711/NAU7802 driver for brake load cell
+Hall effect ADC for throttle/clutch
+Calibration + response curves + dead zones
+Add pedal axes to HID report
+NVS storage for calibration
+Phase 5: Desktop Companion App
+PySide6 UI with serial communication
+FFB settings, pedal calibration, steering config
+Live telemetry with pyqtgraph
+Profile management
+PyInstaller packaging
+Phase 6: Polish & Production
+Extended testing with multiple sim titles
+Custom PCB design (KiCad)
+Enclosure design
+Firmware OTA updates
+Documentation
+Verification Plan
+Phase 1: Open Windows Game Controllers (joy.cpl) → device appears, steering axis moves
+Phase 2: Motor spins with commanded torque, encoder position reads correctly
+Phase 3: Run DXTweak2 FFB test → all effects work. Test in iRacing/ACC → FFB feels correct
+Phase 4: Pedals show in Game Controllers with full range after calibration
+Phase 5: Desktop app connects, changes settings, shows live telemetry
+End-to-end: Complete 30-min race session in iRacing with no faults, smooth FFB, responsive pedals
+Key References
+OpenFFBoard - Study EffectsCalculator and HID descriptor
+USB PID 1.0 Spec - Authoritative FFB HID spec
+Adafruit TinyUSB Library - Arduino TinyUSB wrapper
+ASD2100 manual (user has) - Modbus register map for torque control
