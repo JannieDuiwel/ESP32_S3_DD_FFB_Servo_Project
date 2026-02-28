@@ -80,9 +80,10 @@ class MainWindow(QMainWindow):
         self.status_loop_rate.setText(f"Loop: {loop_rate} Hz")
 
     def _on_steering(self, position: float):
-        """Controller stick moved — send steering command to ESP32."""
+        """Controller stick moved — send steering command to ESP32 and live monitor."""
         pos_int = int(position * 32767)
         self.serial.send_steering(pos_int)
+        self.live_monitor.set_commanded(pos_int)
 
     def _on_controller_status(self, status: str):
         self.status_controller.setText(status)

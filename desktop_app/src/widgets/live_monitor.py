@@ -15,10 +15,11 @@ class LiveMonitor(QWidget):
         super().__init__(parent)
         self._serial = serial_comm
 
-        # Data buffers (ring buffers)
-        self._times = collections.deque(maxlen=HISTORY_LEN)
-        self._servo_angles = collections.deque(maxlen=HISTORY_LEN)
+        # Separate time+data buffers for each source
+        self._cmd_times = collections.deque(maxlen=HISTORY_LEN)
         self._commanded = collections.deque(maxlen=HISTORY_LEN)
+        self._servo_times = collections.deque(maxlen=HISTORY_LEN)
+        self._servo_angles = collections.deque(maxlen=HISTORY_LEN)
         self._start_time = time.monotonic()
         self._last_commanded = 0
 
@@ -63,24 +64,26 @@ class LiveMonitor(QWidget):
         layout.addWidget(self._plot_widget)
 
     def set_commanded(self, position: int):
-        """Called externally to record what was sent to ESP32."""
+        """Called externally when controller input changes."""
         self._last_commanded = position
+        self._lbl_commanded.setText(f"Commanded: {position}")
+        # Always record commanded position so the graph works without ESP32
+        t = time.monotonic() - self._start_time
+        self._cmd_times.append(t)
+        self._commanded.append(position)
 
     def _on_telemetry(self, angle: int, loop_rate: int):
         t = time.monotonic() - self._start_time
-        self._times.append(t)
         # Scale ADC 0-4095 to roughly match commanded range for visual comparison
         scaled_angle = int((angle / 4095.0) * 65535 - 32768)
+        self._servo_times.append(t)
         self._servo_angles.append(scaled_angle)
-        self._commanded.append(self._last_commanded)
 
         self._lbl_angle.setText(f"Servo Angle: {angle}")
-        self._lbl_commanded.setText(f"Commanded: {self._last_commanded}")
         self._lbl_rate.setText(f"Loop Rate: {loop_rate} Hz")
 
     def _update_plot(self):
-        if len(self._times) < 2:
-            return
-        times = list(self._times)
-        self._curve_servo.setData(times, list(self._servo_angles))
-        self._curve_commanded.setData(times, list(self._commanded))
+        if len(self._cmd_times) >= 2:
+            self._curve_commanded.setData(list(self._cmd_times), list(self._commanded))
+        if len(self._servo_times) >= 2:
+            self._curve_servo.setData(list(self._servo_times), list(self._servo_angles))
